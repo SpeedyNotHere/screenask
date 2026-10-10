@@ -1,0 +1,6 @@
+2026/10/10-11:51:10.714 2d14 Reusing MANIFEST C:\Users\andre\Downloads\screenask\screenask.exe.WebView2\EBWebView\Default\Local Storage\leveldb/MANIFEST-000001
+2026/10/10-11:51:10.761 2d14 Recovering log #22
+2026/10/10-11:51:10.766 2d14 Reusing old log C:\Users\andre\Downloads\screenask\screenask.exe.WebView2\EBWebView\Default\Local Storage\leveldb/000022.log 
+2026/10/10-11:51:20.871 1a50 Level-0 table #26: started
+2026/10/10-11:51:20.884 1a50 Level-0 table #26: 65772 bytes OK
+2026/10/10-11:51:20.888 1a50 Delete type=0 #22

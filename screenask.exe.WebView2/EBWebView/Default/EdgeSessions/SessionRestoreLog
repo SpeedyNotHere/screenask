@@ -1,0 +1,18 @@
+{"logTime": "1010/145752", "session": "START"}
+{"logTime": "1010/150438", "session": "END"}
+{"logTime": "1010/152827", "session": "START"}
+{"logTime": "1010/153318", "session": "END"}
+{"logTime": "1010/153606", "session": "START"}
+{"logTime": "1010/153746", "session": "END"}
+{"logTime": "1010/154011", "session": "START"}
+{"logTime": "1010/154027", "session": "END"}
+{"logTime": "1010/154238", "session": "START"}
+{"logTime": "1010/154332", "session": "END"}
+{"logTime": "1010/154511", "session": "START"}
+{"logTime": "1010/154613", "level": "INFO", "location": "components\\sessions\\core\\command_storage_manager.cc:275 operator()", "message": "No valid session file found: SessionRestore"}
+{"logTime": "1010/154613", "level": "INFO", "location": "components\\sessions\\core\\command_storage_manager.cc:275 operator()", "message": "Last session file not found for SessionType : SessionRestore"}
+{"logTime": "1010/154701", "session": "END"}
+{"logTime": "1010/155110", "session": "START"}
+{"logTime": "1010/155132", "session": "END"}
+{"logTime": "1010/155501", "session": "START"}
+{"logTime": "1010/155915", "session": "END"}

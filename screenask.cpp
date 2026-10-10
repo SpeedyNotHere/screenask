@@ -139,6 +139,9 @@ static ICoreWebView2Environment *g_webview_env = NULL;
 static ICoreWebView2Controller *g_webview_controller = NULL;
 static ICoreWebView2 *g_webview = NULL;
 static HMODULE g_webview_loader = NULL;
+/* Use a disposable WebView2 profile instead of the app's/default Edge profile. */
+static wchar_t g_webview_temp_profile[MAX_PATH] = {0};
+
 static EventRegistrationToken g_nav_token = {};
 static int g_webview_ready = 0;
 static int g_task_active = 0;
@@ -182,8 +185,9 @@ static BOOL g_webview_resizing = FALSE;
 static POINT g_webview_resize_start = {0, 0};
 static int g_webview_resize_start_w = 810;
 static int g_webview_resize_start_h = 620;
+static int g_webview_focused_height = 620;
 static int g_swallow_next_enter_char = 0;
-static int g_reasoning_value = 50; /* 0 fast/light, 100 deep */
+static int g_reasoning_value = 0; /* 0 = instant by default; moving right enables thinking */
 static int g_ui_hover_hit = 0;
 static float g_hover_x = 30.0f;
 static float g_hover_x_velocity = 0.0f;
@@ -759,6 +763,39 @@ static int response_token_limit(const char *prompt, int has_image) {
 
 static const char *g_ai_instruction = "only answer the user. only answers. no markdown, no explanations. be brief and direct.";
 
+static void load_groq_key_from_file(void) {
+    wchar_t path[MAX_PATH];
+    wchar_t *slash;
+    FILE *fp;
+    size_t n;
+
+    g_groq_key[0] = 0;
+    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) return;
+    path[MAX_PATH - 1] = 0;
+    slash = wcsrchr(path, L'\\');
+    if (!slash) slash = wcsrchr(path, L'/');
+    if (!slash) return;
+    slash[1] = 0;
+    if (wcslen(path) + 8 >= MAX_PATH) return;
+    wcscat(path, L"key.txt");
+
+    fp = _wfopen(path, L"r, ccs=UTF-8");
+    if (!fp) return;
+    if (fgetws(g_groq_key, (int)(sizeof(g_groq_key) / sizeof(g_groq_key[0])), fp)) {
+        n = wcslen(g_groq_key);
+        while (n > 0 && (g_groq_key[n - 1] == L'\r' || g_groq_key[n - 1] == L'\n' ||
+                         g_groq_key[n - 1] == L' ' || g_groq_key[n - 1] == L'\t')) {
+            g_groq_key[--n] = 0;
+        }
+        {
+            size_t start = 0;
+            while (g_groq_key[start] == L' ' || g_groq_key[start] == L'\t') ++start;
+            if (start) memmove(g_groq_key, g_groq_key + start, (wcslen(g_groq_key + start) + 1) * sizeof(wchar_t));
+        }
+    }
+    fclose(fp);
+}
+
 static char *groq_request(const char *prompt, const char *image64, DWORD *http_status) {
     HINTERNET session = NULL, connect = NULL, request = NULL;
     char *eprompt = NULL, *key8 = NULL, *body = NULL, *response = NULL;
@@ -784,20 +821,32 @@ static char *groq_request(const char *prompt, const char *image64, DWORD *http_s
     {
         int has_image = image64 && image64[0];
         int max_tokens = response_token_limit(prompt, has_image);
+        const char *effort = "none";
+        double temperature = 0.7;
+
+        /* The untouched/leftmost position stays in fast instruct mode.
+           Any deliberate movement to the right enables Qwen thinking. */
+        if (g_reasoning_value > 0) {
+            if (g_reasoning_value < 34) effort = "low";
+            else if (g_reasoning_value < 67) effort = "medium";
+            else effort = "high";
+            temperature = 1.0;
+        }
+
         if (has_image) {
-            body_len = strlen(eprompt) + strlen(image64) + 1200;
+            body_len = strlen(eprompt) + strlen(image64) + 1400;
             body = (char *)malloc(body_len);
             if (!body) goto cleanup;
             snprintf(body, body_len,
-                "{\"model\":\"%ls\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"%s\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,%s\"}}]}],\"temperature\":0.2,\"reasoning_effort\":\"none\",\"max_completion_tokens\":%d,\"stream\":false}",
-                GROQ_MODEL, eprompt, image64, max_tokens);
+                "{\"model\":\"%ls\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"%s\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,%s\"}}]}],\"temperature\":%.1f,\"reasoning_effort\":\"%s\",\"max_completion_tokens\":%d,\"stream\":false}",
+                GROQ_MODEL, eprompt, image64, temperature, effort, max_tokens);
         } else {
-            body_len = strlen(eprompt) + 900;
+            body_len = strlen(eprompt) + 1000;
             body = (char *)malloc(body_len);
             if (!body) goto cleanup;
             snprintf(body, body_len,
-                "{\"model\":\"%ls\",\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],\"temperature\":0.2,\"reasoning_effort\":\"none\",\"max_completion_tokens\":%d,\"stream\":false}",
-                GROQ_MODEL, eprompt, max_tokens);
+                "{\"model\":\"%ls\",\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],\"temperature\":%.1f,\"reasoning_effort\":\"%s\",\"max_completion_tokens\":%d,\"stream\":false}",
+                GROQ_MODEL, eprompt, temperature, effort, max_tokens);
         }
     }
 
@@ -2098,6 +2147,12 @@ static void resize_embedded_webview(void) {
     if (!g_webview_controller || !g_hwnd) return;
     RECT bounds;
     GetClientRect(g_hwnd, &bounds);
+    /* Keep a narrow strip outside the WebView at the bottom so the resize
+       grip is always above the webpage and can never be covered by it. */
+    if (g_search_state != SEARCH_IDLE) {
+        bounds.bottom -= 22;
+        if (bounds.bottom < 1) bounds.bottom = 1;
+    }
     g_webview_controller->put_Bounds(bounds);
 }
 
@@ -2221,6 +2276,8 @@ public:
             settings->put_AreDefaultScriptDialogsEnabled(TRUE);
             settings->put_IsWebMessageEnabled(TRUE);
             settings->put_AreDevToolsEnabled(FALSE);
+            /* These newer autofill settings are not exposed by every bundled WebView2 SDK.
+               Session data is isolated by the temporary user-data profile instead. */
             settings->Release();
         }
 
@@ -2288,17 +2345,58 @@ static int ensure_webview_environment(void) {
     create_env_fn fn = (create_env_fn)GetProcAddress(g_webview_loader, "CreateCoreWebView2EnvironmentWithOptions");
     if (!fn) return 0;
 
+    /* Keep cookies, cache, and history out of the user's normal Edge profile.
+       This per-process profile is stored under TEMP and removed at shutdown. */
+    if (!g_webview_temp_profile[0]) {
+        wchar_t temp_path[MAX_PATH];
+        DWORD n = GetTempPathW(MAX_PATH, temp_path);
+        if (!n || n >= MAX_PATH) return 0;
+        if (swprintf(g_webview_temp_profile, MAX_PATH,
+                     L"%lsScreenAsk-WebView-%lu", temp_path,
+                     (unsigned long)GetCurrentProcessId()) < 0) return 0;
+        if (!CreateDirectoryW(g_webview_temp_profile, NULL) &&
+            GetLastError() != ERROR_ALREADY_EXISTS) {
+            g_webview_temp_profile[0] = 0;
+            return 0;
+        }
+    }
+
     screenask_environment_handler *handler = new screenask_environment_handler();
-    HRESULT hr = fn(NULL, NULL, NULL, handler);
+    HRESULT hr = fn(NULL, g_webview_temp_profile, NULL, handler);
     handler->Release();
     return SUCCEEDED(hr);
+}
+
+static void delete_temp_tree(const wchar_t *path) {
+    wchar_t pattern[MAX_PATH * 2];
+    WIN32_FIND_DATAW fd;
+    HANDLE find;
+    if (!path || !path[0]) return;
+    swprintf(pattern, sizeof(pattern) / sizeof(pattern[0]), L"%ls\\*", path);
+    find = FindFirstFileW(pattern, &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t child[MAX_PATH * 2];
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            swprintf(child, sizeof(child) / sizeof(child[0]), L"%ls\\%ls", path, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                delete_temp_tree(child);
+                RemoveDirectoryW(child);
+            } else {
+                SetFileAttributesW(child, FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(child);
+            }
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
 }
 
 static void clear_preview(void);
 
 static void search_enter_layout(void) {
     g_search_state = SEARCH_LOADING;
-    g_bar_target_h = 520;
+    /* Give the embedded webpage a much taller default viewport. */
+    g_bar_target_h = 800;
     g_bar_w = 760;
     g_window_w = 760;
     g_bar_w_float = 760.0f;
@@ -2410,7 +2508,91 @@ static int search_slash_command(const char *command_name, const char *argument) 
         return 1;
     }
 
+    /* Open the Windows Settings app directly, just like the dedicated
+       search commands above handle their own action instead of falling
+       through to the generic shell-command path. */
+    if (!_stricmp(command_name, "/sys")) {
+        HINSTANCE result = ShellExecuteW(NULL, L"open", L"ms-settings:", NULL, NULL, SW_SHOWNORMAL);
+        if ((INT_PTR)result <= 32) {
+            post_task_status("screenask: couldn't open windows settings");
+        } else {
+            post_task_status("screenask: opening windows settings");
+        }
+        return 1;
+    }
+
     return 0;
+}
+
+
+typedef struct { wchar_t *command; } SlashRunArgs;
+
+static DWORD WINAPI slash_run_thread(LPVOID parameter) {
+    SlashRunArgs *args = (SlashRunArgs *)parameter;
+    if (args) {
+        run_shell_command(args->command);
+        free(args->command);
+        free(args);
+    }
+    return 0;
+}
+
+typedef struct { wchar_t *name; int found; } FocusWindowArgs;
+
+static int contains_wide_case_insensitive(const wchar_t *text, const wchar_t *needle) {
+    size_t n;
+    const wchar_t *p;
+    if (!text || !needle || !needle[0]) return 0;
+    n = wcslen(needle);
+    for (p = text; *p; ++p) {
+        if (_wcsnicmp(p, needle, n) == 0) return 1;
+    }
+    return 0;
+}
+
+static int open_windows_run_dialog(void) {
+    INPUT in[4];
+    ZeroMemory(in, sizeof(in));
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_LWIN;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = 'R';
+    in[2].type = INPUT_KEYBOARD;
+    in[2].ki.wVk = 'R';
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].type = INPUT_KEYBOARD;
+    in[3].ki.wVk = VK_LWIN;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    return SendInput(4, in, sizeof(INPUT)) == 4;
+}
+
+static BOOL CALLBACK find_window_by_title(HWND hwnd, LPARAM lparam) {
+    FocusWindowArgs *args = (FocusWindowArgs *)lparam;
+    wchar_t title[512];
+    if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER)) return TRUE;
+    title[0] = 0;
+    GetWindowTextW(hwnd, title, (int)(sizeof(title) / sizeof(title[0])));
+    if (title[0] && contains_wide_case_insensitive(title, args->name)) {
+        args->found = 1;
+        ShowWindow(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_MAXIMIZE);
+        SetForegroundWindow(hwnd);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static int focus_maximize_window(const char *title_utf8) {
+    FocusWindowArgs args;
+    wchar_t *wide;
+    if (!title_utf8 || !title_utf8[0]) return 0;
+    wide = utf8_to_wide(title_utf8, -1);
+    if (!wide) return 0;
+    args.name = wide;
+    args.found = 0;
+    EnumWindows(find_window_by_title, (LPARAM)&args);
+    free(wide);
+    return args.found;
 }
 
 static int slash_command(const char *prompt) {
@@ -2420,6 +2602,31 @@ static int slash_command(const char *prompt) {
     char cmd[64];
 
     if (!prompt || prompt[0] != '/') return 0;
+
+    /* />window title: accept both />chrome and />[chrome], case-insensitively. */
+    if (prompt[1] == '>') {
+        const char *title = prompt + 2;
+        char title_buf[512];
+        size_t len;
+        while (*title == ' ' || *title == '\t') ++title;
+        len = strlen(title);
+        while (len && (title[len - 1] == ' ' || title[len - 1] == '\t')) --len;
+        if (len >= 2 && title[0] == '[' && title[len - 1] == ']') {
+            ++title;
+            len -= 2;
+        }
+        if (len >= sizeof(title_buf)) len = sizeof(title_buf) - 1;
+        memcpy(title_buf, title, len);
+        title_buf[len] = '\0';
+        if (!title_buf[0]) {
+            post_task_status("screenask: usage: />window name (or />[window name])");
+        } else if (!focus_maximize_window(title_buf)) {
+            post_task_status("screenask: window not found");
+        } else {
+            post_task_status("screenask: focused window");
+        }
+        return 1;
+    }
 
     space = strchr(prompt, ' ');
     if (space) {
@@ -2435,6 +2642,22 @@ static int slash_command(const char *prompt) {
         arg = "";
     }
 
+    if (!_stricmp(cmd, "/help")) {
+        MessageBoxW(g_hwnd,
+            L"ScreenAsk commands\n\n"
+            L"/help - show this command list\n"
+            L"/google <query> - search Google in the WebView\n"
+            L"/youtube <query> or /yt <query> - search YouTube\n"
+            L"/run <command> - execute the supplied command\n"
+            L"/open <app, file, or URL> - open a target\n"
+            L"/music <action> - control media or volume\n"
+            L"/sys - open Windows Settings\n"
+            L"/> <window title> - focus and maximize a matching window\n"
+            L"/ask <prompt> - send a prompt to the assistant",
+            L"ScreenAsk Help", MB_OK | MB_ICONINFORMATION);
+        return 1;
+    }
+
     if (search_slash_command(cmd, arg))
         return 1;
 
@@ -2442,24 +2665,42 @@ static int slash_command(const char *prompt) {
         if (!_stricmp(cmd, g_slash_cmd[i])) {
             if (!_stricmp(g_slash_action[i], "run")) {
                 if (arg[0]) {
-                    wchar_t *w = utf8_to_wide(arg, -1);
-                    if (w) {
-                        run_shell_command(w);
-                        free(w);
+                    SlashRunArgs *args = (SlashRunArgs *)calloc(1, sizeof(*args));
+                    if (args) {
+                        args->command = utf8_to_wide(arg, -1);
+                        if (args->command) {
+                            HANDLE thread = CreateThread(NULL, 0, slash_run_thread, args, 0, NULL);
+                            if (thread) CloseHandle(thread);
+                            else { free(args->command); free(args); post_task_status("screenask: couldn't start command"); }
+                        } else free(args);
                     }
+                } else {
+                    post_task_status("screenask: usage: /run command");
                 }
                 return 1;
             }
             if (!_stricmp(g_slash_action[i], "open")) {
+                if (!arg[0]) {
+                    post_task_status("screenask: usage: /open app, file, or url");
+                    return 1;
+                }
                 wchar_t *w = utf8_to_wide(arg, -1);
                 if (w) {
-                    ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+                    HINSTANCE result = ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+                    if ((INT_PTR)result <= 32)
+                        post_task_status("screenask: couldn't open target");
                     free(w);
+                } else {
+                    post_task_status("screenask: couldn't read target");
                 }
                 return 1;
             }
             if (!_stricmp(g_slash_action[i], "music")) {
-                run_direct_shortcut(arg);
+                if (!arg[0]) {
+                    post_task_status("screenask: usage: /music action");
+                } else if (!run_direct_shortcut(arg)) {
+                    post_task_status("screenask: unknown music action");
+                }
                 return 1;
             }
             if (!_stricmp(g_slash_action[i], "ask")) return 0;
@@ -2614,6 +2855,12 @@ static void submit_prompt(void) {
     /* slash commands are local routes and must never fall through to the ai api. */
     if (prompt8[0] == '/') {
         if (slash_command(prompt8)) {
+            /* Clear the command after dispatch so the next command can be typed
+               immediately. Do this only after slash_command has copied/used its
+               argument, and do not clear /ask because it deliberately falls
+               through to the normal AI request path. */
+            SetWindowTextW(g_edit, L"");
+            PostMessageW(g_hwnd, WM_TEXT_CHANGED, 0, 0);
             free(prompt8);
             return;
         }
@@ -2712,18 +2959,9 @@ static void submit_prompt(void) {
 
 static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_ERASEBKGND) return 1;
-    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
-        if (GetKeyState(VK_SHIFT) & 0x8000) {
-            g_swallow_next_enter_char = 1;
-            SendMessageW(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"\r\n");
-            g_arrow_l_bounce_v -= 18.0f;
-            g_arrow_r_bounce_v += 18.0f;
-            PostMessageW(g_hwnd, WM_TEXT_CHANGED, 0, 0);
-            return 0;
-        }
-        PostMessageW(g_hwnd, WM_SUBMIT, 0, 0);
-        return 0;
-    }
+    /* Enter is handled in WM_CHAR below.  TranslateMessage can queue WM_CHAR
+       even when WM_KEYDOWN is consumed, so submitting from WM_KEYDOWN can still
+       allow the edit control to insert a newline afterwards. */
     if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
         PostMessageW(g_hwnd, WM_HIDE_BAR, 0, 0);
         return 0;
@@ -2787,6 +3025,20 @@ static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
        leave the old 8/127 control glyph behind in the textbox. */
     if (msg == WM_CHAR) {
         LRESULT r;
+        if (wParam == 13 || wParam == 10) {
+            if (GetKeyState(VK_SHIFT) & 0x8000) {
+                /* Let Shift+Enter insert a line break, but swallow the paired
+                   carriage-return/line-feed character if the control emits it. */
+                g_swallow_next_enter_char = 1;
+                SendMessageW(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"\r\n");
+                g_arrow_l_bounce_v -= 18.0f;
+                g_arrow_r_bounce_v += 18.0f;
+                PostMessageW(g_hwnd, WM_TEXT_CHANGED, 0, 0);
+                return 0;
+            }
+            SendMessageW(g_hwnd, WM_SUBMIT, 0, 0);
+            return 0;
+        }
         if (g_swallow_next_enter_char && (wParam == 10 || wParam == 13)) {
             g_swallow_next_enter_char = 0;
             return 0;
@@ -2889,12 +3141,12 @@ static void update_bar_width(void) {
     }
     /* Let the spring pass its target briefly. Hard-clamping to 790..810
        removed all visible overshoot, making focus/defocus look static. */
-    if (next_width < 695.0f) {
-        next_width = 695.0f;
+    if (next_width < (g_bar_focused ? 695.0f : 190.0f)) {
+        next_width = g_bar_focused ? 695.0f : 190.0f;
         if (g_bar_w_velocity < 0.0f) g_bar_w_velocity = -g_bar_w_velocity * 0.42f;
     }
-    if (next_width > 815.0f) {
-        next_width = 815.0f;
+    if (next_width > (g_bar_focused ? 815.0f : 215.0f)) {
+        next_width = g_bar_focused ? 815.0f : 215.0f;
         if (g_bar_w_velocity > 0.0f) g_bar_w_velocity = -g_bar_w_velocity * 0.42f;
     }
     next_w = (int)(next_width + 0.5f);
@@ -2907,7 +3159,7 @@ static void update_bar_width(void) {
         SetWindowPos(g_hwnd, NULL, x, wr.top, next_w, g_bar_h,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     }
-    if (g_edit && g_search_state == SEARCH_IDLE)
+    if (g_edit && g_search_state == SEARCH_IDLE && g_bar_focused)
         SetWindowPos(g_edit, NULL, 58, 9, g_bar_w - 300, g_bar_h - 18,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     make_round(g_hwnd);
@@ -2920,8 +3172,13 @@ static void update_response_box(void) {
     float next_float;
     int next_h;
 
+    int min_h;
     if (!g_visible) return;
-    if (g_bar_target_h < 54) g_bar_target_h = 54;
+
+    /* The compact unfocused bar must be allowed to reach half height.
+       Keep the normal 54px minimum while focused or showing active content. */
+    min_h = (!g_bar_focused && g_search_state == SEARCH_IDLE && !g_busy) ? 27 : 54;
+    if (g_bar_target_h < min_h) g_bar_target_h = min_h;
 
     distance = (float)g_bar_target_h - g_bar_h_float;
     g_bar_h_v += distance * 0.24f;
@@ -2933,7 +3190,7 @@ static void update_response_box(void) {
         g_bar_h_v = 0.0f;
     }
 
-    if (next_float < 54.0f) next_float = 54.0f;
+    if (next_float < (float)min_h) next_float = (float)min_h;
     if (next_float > 700.0f) next_float = 700.0f;
     next_h = (int)(next_float + 0.5f);
 
@@ -2944,11 +3201,10 @@ static void update_response_box(void) {
         SetWindowPos(g_hwnd, NULL, 0, 0, g_window_w, g_bar_h,
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW);
         make_round(g_hwnd);
-        if (g_search_state == SEARCH_IDLE) {
+        if (g_search_state == SEARCH_IDLE && g_bar_focused && g_edit) {
             SendMessageW(g_edit, WM_SETREDRAW, FALSE, 0);
             SetWindowPos(g_edit, NULL, 58, 9, g_bar_w - 300, g_bar_h - 18,
                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW);
-            
             SendMessageW(g_edit, WM_SETREDRAW, TRUE, 0);
         }
         RedrawWindow(g_hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_NOERASE);
@@ -3240,17 +3496,12 @@ static void paint_window(HWND hwnd, HDC hdc) {
 
     if (g_search_state == SEARCH_IDLE && g_glass_assets_ok) {
         BOOL compact_bar = (rc.bottom <= GLASS_BAR_H);
-        BOOL live_backdrop = (g_visible &&
-                              g_glass_dc && g_glass_pixels);
-
-        /* Capture and blur the entire current window size, including the expanded
-           response area. Never stretch the compact bar's 54px backdrop. */
-        if (live_backdrop) capture_live_glass(memdc);
-        else {
-            bg = CreateSolidBrush(RGB(15, 28, 43));
-            FillRect(memdc, &rc, bg);
-            DeleteObject(bg);
-        }
+        /* Always capture the desktop for the first visible frame too.  The old
+           fallback painted an opaque navy rectangle whenever the cached glass
+           surface was not ready yet, which looked like the background had been
+           darkened on startup/reopen.  capture_live_glass() refreshes the pixels
+           and applies blur without adding a dark tint. */
+        capture_live_glass(memdc);
         if (!compact_bar) {
             /* outline only: an opaque fill here hides the captured blurred
                backdrop whenever the bar expands. */
@@ -3262,15 +3513,33 @@ static void paint_window(HWND hwnd, HDC hdc) {
             SelectObject(memdc, old_pen);
             DeleteObject(shell_pen);
         }
-        /* Always draw the complete control row in the same coordinates as its
-           hit targets, including the settings icon in expanded mode. */
-        glassbar_draw(memdc, compact_bar ? 1 : 0, g_screenshot_enabled,
-                      g_ui_hover_hit, g_reasoning_value, g_hover_x,
-                      g_hover_y_offset, g_slider_label_font);
+        /* In the idle defocused state, the HWND itself is resized by the
+           width/height spring. Do not paint the full control row and rely on
+           the rounded region to clip it: render only the blurred glass shell.
+           All controls return when the bar regains focus. */
+        if (g_bar_focused || g_busy || g_search_state != SEARCH_IDLE) {
+            glassbar_draw(memdc, compact_bar ? 1 : 0, g_screenshot_enabled,
+                          g_ui_hover_hit, g_reasoning_value, g_hover_x,
+                          g_hover_y_offset, g_slider_label_font);
+        } else {
+            HPEN shell_pen = CreatePen(PS_SOLID, 1, RGB(140, 164, 187));
+            HGDIOBJ old_brush = SelectObject(memdc, GetStockObject(HOLLOW_BRUSH));
+            HGDIOBJ old_pen = SelectObject(memdc, shell_pen);
+            RoundRect(memdc, 0, 0, rc.right, rc.bottom, 28, 28);
+            SelectObject(memdc, old_brush);
+            SelectObject(memdc, old_pen);
+            DeleteObject(shell_pen);
+        }
     } else {
-        bg = CreateSolidBrush(RGB(24, 24, 27));
-        FillRect(memdc, &rc, bg);
-        DeleteObject(bg);
+        if (g_search_state != SEARCH_IDLE) {
+            /* Avoid the flat gray slab behind WebView commands: use the same live
+               desktop-glass capture as the idle bar, without an extra dark overlay. */
+            capture_live_glass(memdc);
+        } else {
+            bg = CreateSolidBrush(RGB(24, 24, 27));
+            FillRect(memdc, &rc, bg);
+            DeleteObject(bg);
+        }
         border = CreatePen(PS_SOLID, 1, RGB(50, 50, 56));
         oldb = SelectObject(memdc, GetStockObject(NULL_BRUSH));
         oldp = SelectObject(memdc, border);
@@ -3278,6 +3547,21 @@ static void paint_window(HWND hwnd, HDC hdc) {
         SelectObject(memdc, oldb);
         SelectObject(memdc, oldp);
         DeleteObject(border);
+
+        /* Draw the resize grip in the reserved bottom strip, outside the
+           WebView controller bounds so the webpage cannot cover it. */
+        if (g_search_state != SEARCH_IDLE && g_bar_w > 30 && g_bar_h > 30) {
+            HPEN grip_pen = CreatePen(PS_SOLID, 2, RGB(190, 198, 210));
+            HGDIOBJ old_grip_pen = SelectObject(memdc, grip_pen);
+            int gx = g_bar_w - 9;
+            int gy = g_bar_h - 7;
+            MoveToEx(memdc, gx - 14, gy, NULL); LineTo(memdc, gx, gy - 14);
+            MoveToEx(memdc, gx - 9, gy, NULL); LineTo(memdc, gx, gy - 9);
+            MoveToEx(memdc, gx - 4, gy, NULL); LineTo(memdc, gx, gy - 4);
+            SelectObject(memdc, old_grip_pen);
+            DeleteObject(grip_pen);
+        }
+
         if (g_search_state == SEARCH_IDLE && g_screenshot_enabled) {
             RECT preview;
             preview.left = g_bar_w - 108;
@@ -3328,22 +3612,8 @@ static void paint_window(HWND hwnd, HDC hdc) {
         DeleteObject(status_font);
     }
 
-    /* focus inversion: while active, keep the controls crisp over the live
-       blurred backdrop; while inactive, blur the fully composed bar itself. */
-    if (!g_bar_focused && g_search_state == SEARCH_IDLE && g_glass_assets_ok &&
-        g_glass_dc && g_glass_pixels && g_glass_raw && g_glass_scratch &&
-        rc.right <= GLASS_BAR_W && rc.bottom <= 700 &&
-        InterlockedCompareExchange(&g_glass_capture_busy, 1, 0) == 0) {
-        g_glass_w = rc.right;
-        g_glass_h = rc.bottom;
-        if (BitBlt(g_glass_dc, 0, 0, g_glass_w, g_glass_h,
-                   memdc, 0, 0, SRCCOPY)) {
-            blur_glass_pixels();
-            BitBlt(memdc, 0, 0, g_glass_w, g_glass_h,
-                   g_glass_dc, 0, 0, SRCCOPY);
-        }
-        InterlockedExchange(&g_glass_capture_busy, 0);
-    }
+    /* Do not blur or darken the fully composed bar here. The live backdrop is
+       already captured and blurred before the controls are drawn above it. */
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, memdc, 0, 0, SRCCOPY);
     SelectObject(memdc, oldbmp);
@@ -3662,7 +3932,27 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             BOOL now_focused = (LOWORD(wParam) != WA_INACTIVE);
             if (now_focused != g_bar_focused) {
                 g_bar_focused = now_focused;
-                g_bar_w_target = g_bar_focused ? 810 : 700;
+                /* Hide the edit child while idle and defocused. The HWND's own
+                   width/height animate down; this is not a clipping-only effect. */
+                if (g_edit && g_search_state == SEARCH_IDLE && !g_busy) {
+                    ShowWindow(g_edit, g_bar_focused ? SW_SHOW : SW_HIDE);
+                }
+                /* Defocused width stays compact. For WebView commands, halve the
+                   actual current custom height on blur and restore it on focus. */
+                g_bar_w_target = g_bar_focused ? 810 : 203;
+                if (g_search_state != SEARCH_IDLE) {
+                    if (g_bar_focused) {
+                        g_bar_target_h = g_webview_focused_height;
+                    } else {
+                        g_webview_focused_height = g_bar_h > 0 ? g_bar_h : g_bar_target_h;
+                        g_bar_target_h = g_webview_focused_height / 2;
+                        if (g_bar_target_h < 27) g_bar_target_h = 27;
+                    }
+                    g_bar_h_v = (float)(g_bar_target_h - g_bar_h_float) * 0.18f;
+                } else if (!g_busy) {
+                    g_bar_target_h = g_bar_focused ? 54 : 27;
+                    g_bar_h_v = (float)(g_bar_target_h - g_bar_h_float) * 0.18f;
+                }
                 /* Kick the same damped spring used by the arrow bounce so the
                    width visibly overshoots and settles instead of just easing. */
                 g_bar_w_velocity = g_bar_focused ? 6.0f : -6.0f;
@@ -3683,21 +3973,47 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             TrackMouseEvent(&tme);
             pt.x = GET_X_LPARAM(lParam); pt.y = GET_Y_LPARAM(lParam);
             if (g_webview_resizing && (wParam & MK_LBUTTON) && g_search_state != SEARCH_IDLE) {
-                int nw = g_webview_resize_start_w + (pt.x - g_webview_resize_start.x);
+                /* WebView commands resize vertically only; keep the original width. */
+                int nw = g_webview_resize_start_w;
                 int nh = g_webview_resize_start_h + (pt.y - g_webview_resize_start.y);
-                if (nw < 520) nw = 520;
-                if (nw > 1100) nw = 1100;
                 if (nh < 260) nh = 260;
-                if (nh > 900) nh = 900;
+                if (nh > 1200) nh = 1200;
                 g_bar_w_target = nw;
                 g_bar_w_float = (float)nw;
                 g_bar_w = g_window_w = nw;
                 g_bar_target_h = nh;
+                g_webview_focused_height = nh;
                 g_bar_h_float = (float)nh;
                 g_bar_h = nh;
                 g_bar_h_v = 0.0f;
-                SetWindowPos(g_hwnd, NULL, 0, 0, nw, nh,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                /* Keep the WebView bar horizontally centered during corner resizing.
+                   A previous SWP_NOMOVE resize could preserve a stale left edge after
+                   a defocused drag/restore, making the window appear to jump off-screen. */
+                {
+                    RECT work = {0};
+                    RECT wr = {0};
+                    POINT center_pt;
+                    int x;
+                    int y;
+                    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+                    MONITORINFO mi;
+                    ZeroMemory(&mi, sizeof(mi));
+                    mi.cbSize = sizeof(mi);
+                    if (mon && GetMonitorInfoW(mon, &mi)) {
+                        work = mi.rcWork;
+                    } else {
+                        work.left = 0;
+                        work.right = GetSystemMetrics(SM_CXSCREEN);
+                    }
+                    x = work.left + ((work.right - work.left) - nw) / 2;
+                    if (x < work.left + 8) x = work.left + 8;
+                    if (x + nw > work.right - 8) x = work.right - nw - 8;
+                    if (x < work.left) x = work.left;
+                    y = 0;
+                    if (GetWindowRect(g_hwnd, &wr)) y = wr.top;
+                    SetWindowPos(g_hwnd, NULL, x, y, nw, nh,
+                                 SWP_NOZORDER | SWP_NOACTIVATE);
+                }
                 make_round(g_hwnd);
                 resize_embedded_webview();
                 position_browser_button();
@@ -3791,8 +4107,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             int hit = ui_hit_test(x, y);
-            /* bottom-right grip resizes the embedded webpage panel and host window */
-            if (g_search_state != SEARCH_IDLE && x >= g_window_w - 24 && y >= g_bar_h - 24) {
+            /* Grab the visible bottom-right corner grip to resize height only. */
+            if (g_search_state != SEARCH_IDLE &&
+                x >= g_bar_w - 30 && y >= g_bar_h - 24) {
                 g_webview_resizing = TRUE;
                 g_webview_resize_start.x = x;
                 g_webview_resize_start.y = y;
@@ -3978,6 +4295,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 FreeLibrary(g_webview_loader);
                 g_webview_loader = NULL;
             }
+            /* WebView2 may take a moment to release its profile files. */
+            if (g_webview_temp_profile[0]) {
+                Sleep(250);
+                delete_temp_tree(g_webview_temp_profile);
+                RemoveDirectoryW(g_webview_temp_profile);
+                g_webview_temp_profile[0] = 0;
+            }
             hide_control_overlay();
             UnregisterHotKey(hwnd, ESC_HOTKEY_ID);
             if (g_control_overlay) DestroyWindow(g_control_overlay);
@@ -3997,6 +4321,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
+    /* Defensive fallback for compilers that do not prove every path returns. */
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
@@ -4007,6 +4333,8 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmd, int show) {
     (void)prev;
     (void)cmd;
     (void)show;
+
+    load_groq_key_from_file();
 
     ZeroMemory(&input, sizeof(input));
     input.GdiplusVersion = 1;
